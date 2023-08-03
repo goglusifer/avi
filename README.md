@@ -1,4 +1,4 @@
 # avi
 Scripts and codes
 
-uploading batch files for multipurpose use
+uploading batch and scripts files for multipurpose use
