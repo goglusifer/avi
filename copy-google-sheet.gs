@@ -1,10 +1,16 @@
 /**
- * Copy a Google Sheet tab into another spreadsheet.
+ * Copy every sheet from one Google spreadsheet into another.
  *
  * People you share the destination with do not need access to the source.
- * The Google account that runs this script still must be able to open the
- * source (Viewer is enough) and edit the destination. Google will not open
- * a spreadsheet this account cannot already see.
+ * The Google account that runs this script must be able to open the source
+ * (Viewer is enough) and edit the destination.
+ *
+ * Each source tab is copied whole, so formatting, merged cells, charts,
+ * images, filters, frozen panes, and column sizes come with it. Formulas are
+ * then replaced with the values calculated in the source, so the destination
+ * still shows the data if a formula pointed at another tab or at the source
+ * file. Destination tabs with the same names are replaced. Tabs that exist
+ * only in the destination are left in place.
  *
  * Setup:
  * 1. Open https://script.google.com and create a project (or Extensions >
@@ -17,37 +23,63 @@
 var CONFIG = {
   // From the spreadsheet URL: /spreadsheets/d/<THIS_PART>/edit
   sourceSpreadsheetId: 'SOURCE_SPREADSHEET_ID',
-  sourceSheetName: 'Sheet1',
 
   // Leave blank to write into the spreadsheet this script is bound to.
-  destinationSpreadsheetId: 'DESTINATION_SPREADSHEET_ID',
-  destinationSheetName: 'Sheet1',
-
-  // 'values'             computed cell values only (safe, self-contained copy)
-  // 'valuesAndFormats'   values plus number formats, fonts, colors, widths, merges
-  // 'wholeSheet'         full tab copy. An existing destination tab is overwritten
-  //                      in place so its id and position stay put.
-  mode: 'valuesAndFormats'
+  destinationSpreadsheetId: 'DESTINATION_SPREADSHEET_ID'
 };
 
 /**
  * Entry point. Run this from the Apps Script editor.
  */
 function copySheet() {
-  var sourceSheet = openSheet_(CONFIG.sourceSpreadsheetId, CONFIG.sourceSheetName, 'source');
+  var sourceSpreadsheet = openSpreadsheet_(CONFIG.sourceSpreadsheetId, 'source');
   var destSpreadsheet = openDestinationSpreadsheet_();
-
-  if (CONFIG.mode === 'wholeSheet') {
-    replaceSheetWithCopy_(sourceSheet, destSpreadsheet, CONFIG.destinationSheetName);
-    return;
+  if (sourceSpreadsheet.getId() === destSpreadsheet.getId()) {
+    throw new Error('Source and destination must be different spreadsheets.');
   }
 
-  var destSheet = destSpreadsheet.getSheetByName(CONFIG.destinationSheetName);
-  if (!destSheet) {
-    destSheet = destSpreadsheet.insertSheet(CONFIG.destinationSheetName);
+  var sourceSheets = sourceSpreadsheet.getSheets();
+  var copies = [];
+  for (var i = 0; i < sourceSheets.length; i++) {
+    var sourceSheet = sourceSheets[i];
+    var copied = sourceSheet.copyTo(destSpreadsheet);
+    // copyTo names the tab "Copy of …", which can collide with a real source
+    // tab. Park it under a temporary name before the next copy.
+    copied.setName(temporarySheetName_(destSpreadsheet, i));
+    writeSourceValues_(sourceSheet, copied);
+    copies.push({
+      name: sourceSheet.getName(),
+      sheet: copied,
+      hidden: sourceSheet.isSheetHidden()
+    });
   }
 
-  copyRange_(sourceSheet, destSheet, CONFIG.mode === 'valuesAndFormats');
+  for (var j = 0; j < copies.length; j++) {
+    var existing = destSpreadsheet.getSheetByName(copies[j].name);
+    if (existing && existing.getSheetId() !== copies[j].sheet.getSheetId()) {
+      destSpreadsheet.deleteSheet(existing);
+    }
+    copies[j].sheet.setName(copies[j].name);
+  }
+
+  // Tab order uses the spreadsheet UI, which a timed trigger does not have.
+  // The data is already copied, so a failed reorder should not fail the run.
+  try {
+    for (var k = 0; k < copies.length; k++) {
+      destSpreadsheet.setActiveSheet(copies[k].sheet);
+      destSpreadsheet.moveActiveSheet(k + 1);
+    }
+  } catch (reorderError) {
+    Logger.log('Sheets were copied, but tab order was left unchanged. ' + reorderError.message);
+  }
+
+  for (var h = 0; h < copies.length; h++) {
+    if (copies[h].hidden) {
+      hideIfPossible_(copies[h].sheet);
+    }
+  }
+
+  copyNamedRanges_(sourceSpreadsheet, destSpreadsheet);
 }
 
 /**
@@ -75,96 +107,65 @@ function openDestinationSpreadsheet_() {
   return SpreadsheetApp.openById(id);
 }
 
-function openSheet_(spreadsheetId, sheetName, label) {
+function openSpreadsheet_(spreadsheetId, label) {
   if (!spreadsheetId || spreadsheetId.indexOf('SPREADSHEET_ID') !== -1) {
     throw new Error('Set the ' + label + ' spreadsheet id in CONFIG.');
   }
-  var spreadsheet;
   try {
-    spreadsheet = SpreadsheetApp.openById(spreadsheetId);
+    return SpreadsheetApp.openById(spreadsheetId);
   } catch (error) {
     throw new Error(
       'Cannot open the ' + label + ' spreadsheet. Share it with the account running this script. ' +
       error.message
     );
   }
-  var sheet = spreadsheet.getSheetByName(sheetName);
-  if (!sheet) {
-    throw new Error(label + ' sheet not found: ' + sheetName);
-  }
-  return sheet;
 }
 
-function copyRange_(sourceSheet, destSheet, withFormats) {
-  var source = sourceSheet.getDataRange();
-  var values = source.getValues();
-  var rowCount = values.length;
-  var colCount = rowCount ? values[0].length : 0;
-  var empty = !rowCount || !colCount || (rowCount === 1 && colCount === 1 && values[0][0] === '');
+/**
+ * copyTo keeps formulas. Cross-sheet formulas do not survive the move, so
+ * write the values already calculated on the source.
+ */
+function writeSourceValues_(sourceSheet, destSheet) {
+  var lastRow = sourceSheet.getLastRow();
+  var lastColumn = sourceSheet.getLastColumn();
+  if (lastRow < 1 || lastColumn < 1) {
+    return;
+  }
 
-  // clearContents leaves merges in place, and setValues cannot write through them.
+  ensureGrid_(destSheet, lastRow, lastColumn);
   unmergeAll_(destSheet);
-  if (!empty) {
-    ensureGrid_(destSheet, rowCount, colCount);
+
+  var height = chunkHeight_(lastColumn);
+  for (var row = 1; row <= lastRow; row += height) {
+    var rowCount = Math.min(height, lastRow - row + 1);
+    var values = sourceSheet.getRange(row, 1, rowCount, lastColumn).getValues();
+    destSheet.getRange(row, 1, rowCount, lastColumn).setValues(values);
   }
 
-  destSheet.clearContents();
-  if (withFormats) {
-    destSheet.clearFormats();
-  }
-  if (empty) {
-    return;
-  }
-
-  var target = destSheet.getRange(1, 1, rowCount, colCount);
-  target.setValues(values);
-
-  if (!withFormats) {
-    return;
-  }
-
-  target.setNumberFormats(source.getNumberFormats());
-  target.setFontWeights(source.getFontWeights());
-  target.setFontStyles(source.getFontStyles());
-  target.setFontColors(source.getFontColors());
-  target.setBackgrounds(source.getBackgrounds());
-  target.setHorizontalAlignments(source.getHorizontalAlignments());
-  target.setVerticalAlignments(source.getVerticalAlignments());
-  target.setWraps(source.getWraps());
-  copyMerges_(source, destSheet);
-  copyDimensions_(sourceSheet, destSheet, rowCount, colCount);
+  copyMerges_(sourceSheet, destSheet);
 }
 
-function replaceSheetWithCopy_(sourceSheet, destSpreadsheet, destName) {
-  var existing = destSpreadsheet.getSheetByName(destName);
-  var copied = sourceSheet.copyTo(destSpreadsheet);
-  if (!existing) {
-    copied.setName(destName);
-    return;
+function copyNamedRanges_(sourceSpreadsheet, destSpreadsheet) {
+  var namedRanges = sourceSpreadsheet.getNamedRanges();
+  for (var i = 0; i < namedRanges.length; i++) {
+    var namedRange = namedRanges[i];
+    var sourceRange = namedRange.getRange();
+    var destSheet = destSpreadsheet.getSheetByName(sourceRange.getSheet().getName());
+    if (!destSheet) {
+      continue;
+    }
+    removeNamedRange_(destSpreadsheet, namedRange.getName());
+    destSpreadsheet.setNamedRange(namedRange.getName(), destSheet.getRange(sourceRange.getA1Notation()));
   }
-
-  // Keep the existing tab. Deleting it would change its id, break formulas on
-  // other tabs, and leave the replacement at the end of the spreadsheet.
-  overwriteSheetFrom_(copied, existing);
-  destSpreadsheet.deleteSheet(copied);
 }
 
-function overwriteSheetFrom_(sourceSheet, destSheet) {
-  var source = sourceSheet.getDataRange();
-  var rowCount = source.getNumRows();
-  var colCount = source.getNumColumns();
-  var empty = rowCount === 1 && colCount === 1 && source.getCell(1, 1).getValue() === '';
-
-  unmergeAll_(destSheet);
-  destSheet.clear();
-  if (empty) {
-    return;
+function removeNamedRange_(spreadsheet, name) {
+  var namedRanges = spreadsheet.getNamedRanges();
+  for (var i = 0; i < namedRanges.length; i++) {
+    if (namedRanges[i].getName() === name) {
+      namedRanges[i].remove();
+    }
   }
-
-  ensureGrid_(destSheet, rowCount, colCount);
-  source.copyTo(destSheet.getRange(1, 1));
-  copyDimensions_(sourceSheet, destSheet, rowCount, colCount);
-  copyFrozen_(sourceSheet, destSheet);
 }
 
 function ensureGrid_(sheet, rows, columns) {
@@ -185,8 +186,8 @@ function unmergeAll_(sheet) {
   }
 }
 
-function copyMerges_(sourceRange, destSheet) {
-  var merges = sourceRange.getMergedRanges();
+function copyMerges_(sourceSheet, destSheet) {
+  var merges = sourceSheet.getRange(1, 1, sourceSheet.getMaxRows(), sourceSheet.getMaxColumns()).getMergedRanges();
   for (var i = 0; i < merges.length; i++) {
     var merge = merges[i];
     var mergeRows = merge.getNumRows();
@@ -199,24 +200,25 @@ function copyMerges_(sourceRange, destSheet) {
   }
 }
 
-function copyDimensions_(sourceSheet, destSheet, rowCount, colCount) {
-  for (var column = 1; column <= colCount; column++) {
-    destSheet.setColumnWidth(column, sourceSheet.getColumnWidth(column));
-  }
-  for (var row = 1; row <= rowCount; row++) {
-    destSheet.setRowHeight(row, sourceSheet.getRowHeight(row));
-  }
+function chunkHeight_(columnCount) {
+  var maxCells = 50000;
+  return Math.max(1, Math.floor(maxCells / Math.max(columnCount, 1)));
 }
 
-function copyFrozen_(sourceSheet, destSheet) {
-  var frozenRows = sourceSheet.getFrozenRows();
-  var frozenColumns = sourceSheet.getFrozenColumns();
-  if (frozenRows >= destSheet.getMaxRows()) {
-    frozenRows = Math.max(0, destSheet.getMaxRows() - 1);
+function temporarySheetName_(spreadsheet, index) {
+  var name = 'copy-tmp-' + index + '-' + new Date().getTime();
+  while (spreadsheet.getSheetByName(name)) {
+    name += 'x';
   }
-  if (frozenColumns >= destSheet.getMaxColumns()) {
-    frozenColumns = Math.max(0, destSheet.getMaxColumns() - 1);
+  return name;
+}
+
+function hideIfPossible_(sheet) {
+  var sheets = sheet.getParent().getSheets();
+  for (var i = 0; i < sheets.length; i++) {
+    if (sheets[i].getSheetId() !== sheet.getSheetId() && !sheets[i].isSheetHidden()) {
+      sheet.hideSheet();
+      return;
+    }
   }
-  destSheet.setFrozenRows(frozenRows);
-  destSheet.setFrozenColumns(frozenColumns);
 }
